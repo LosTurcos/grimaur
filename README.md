@@ -1,4 +1,4 @@
-# aurgit
+# aur
 
 `aur` is a lightweight AUR helper that searches, builds, and updates AUR packages using the official git mirror.
 
