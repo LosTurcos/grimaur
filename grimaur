@@ -966,6 +966,7 @@ def update_packages(
     *,
     refresh: bool,
     noconfirm: bool,
+    include_devel: bool,
     targets: Optional[Sequence[str]] = None,
 ) -> None:
     candidates: List[tuple[str, Optional[str]]]
@@ -986,8 +987,12 @@ def update_packages(
 
     missing: List[str] = []
     pending_updates: List[UpdateCandidate] = []
+    skip_devel = not include_devel and not targets
+
     for package, installed_version in candidates:
         if is_debug_package(package):
+            continue
+        if skip_devel and is_vcs_package(package):
             continue
 
         remote_version: Optional[str] = None
@@ -1543,6 +1548,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Specific foreign package names to update (default: all from pacman -Qm)",
     )
     update_parser.add_argument("--noconfirm", action="store_true", help="Pass --noconfirm to pacman/makepkg")
+    update_parser.add_argument(
+        "--devel",
+        action="store_true",
+        help="Include VCS/devel packages (e.g. *-git) when checking for updates",
+    )
     search_parser = subparsers.add_parser("search", help="Search packages via the configured backend")
     search_parser.add_argument("pattern", help="Substring or regex to match against package names")
     search_parser.add_argument("--regex", action="store_true", help="Treat the pattern as a regular expression")
@@ -1620,7 +1630,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 dest_root,
                 refresh=True,
                 noconfirm=args.noconfirm,
-                targets=args.packages,
+                include_devel=bool(getattr(args, "devel", False)),
+                targets=args.packages or None,
             )
         elif args.command == "search":
             regex_obj: Optional[re.Pattern] = None
