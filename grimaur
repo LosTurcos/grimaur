@@ -82,6 +82,15 @@ class SearchResult:
     score: int
 
 
+@dataclass(frozen=True)
+class UpdateCandidate:
+    name: str
+    installed_version: Optional[str]
+    target_version: Optional[str]
+    remote_head: Optional[str]
+    local_head: Optional[str]
+
+
 def run_command(
     cmd: Sequence[str],
     *,
@@ -535,6 +544,7 @@ def update_packages(
         candidates = list(foreign.items())
 
     missing: List[str] = []
+    pending_updates: List[UpdateCandidate] = []
     for package, installed_version in candidates:
         if is_debug_package(package):
             print(style(f"==> Skipping debug package {package}", DIM))
@@ -542,6 +552,7 @@ def update_packages(
 
         remote_version: Optional[str] = None
         remote_head: Optional[str] = None
+        local_head: Optional[str] = None
 
         meta = git_srcinfo_metadata(package)
         if meta:
@@ -552,6 +563,8 @@ def update_packages(
             if remote_head is None:
                 missing.append(package)
                 continue
+            package_dir = dest_root / package
+            local_head = get_local_head(package_dir)
 
         if installed_version and remote_version and installed_version == remote_version:
             print(style(f"==> {package} already up to date ({installed_version})", CYAN))
@@ -559,20 +572,70 @@ def update_packages(
 
         if remote_head:
             package_dir = dest_root / package
-            local_head = get_local_head(package_dir)
+            if local_head is None:
+                local_head = get_local_head(package_dir)
             if local_head and local_head == remote_head:
                 print(style(f"==> {package} matches remote HEAD (skipping build)", CYAN))
                 continue
 
+        pending_updates.append(
+            UpdateCandidate(
+                name=package,
+                installed_version=installed_version,
+                target_version=remote_version,
+                remote_head=remote_head,
+                local_head=local_head,
+            )
+        )
+
+    if not pending_updates:
+        if missing:
+            for package in missing:
+                if is_debug_package(package):
+                    continue
+                print(f"note: {package} is not in the AUR mirror", file=sys.stderr)
+        else:
+            print(style("All monitored packages are up to date.", CYAN))
+        return
+
+    print(style("Packages with available updates:", CYAN))
+    for index, candidate in enumerate(pending_updates, start=1):
+        for line in format_update_candidate(index, candidate):
+            print(line)
+
+    interactive = sys.stdin.isatty() and sys.stdout.isatty()
+    if interactive:
+        selected_candidates = interactive_select_updates(pending_updates)
+        if not selected_candidates:
+            print(style("No packages selected.", DIM))
+            return
+    else:
+        selected_candidates = pending_updates
+
+    print(style("Updating selected packages:", CYAN))
+    for candidate in selected_candidates:
+        from_version = candidate.installed_version or "?"
+        if candidate.target_version:
+            to_version = candidate.target_version
+        elif candidate.remote_head:
+            to_version = candidate.remote_head[:7]
+        else:
+            to_version = "unknown"
+        label = style(candidate.name, BOLD)
+        print(f"  {label} {style(f'{from_version} -> {to_version}', GREEN)}")
+
+    shared_visited: Set[str] = set()
+    for candidate in selected_candidates:
         try:
             install_package(
-                package,
+                candidate.name,
                 dest_root,
                 refresh=refresh,
                 noconfirm=noconfirm,
+                visited=shared_visited,
             )
         except AurGitError as exc:
-            print(f"error updating {package}: {exc}", file=sys.stderr)
+            print(f"error updating {candidate.name}: {exc}", file=sys.stderr)
 
     for package in missing:
         if is_debug_package(package):
@@ -652,6 +715,60 @@ def print_search_results(results: Sequence[SearchResult]) -> None:
         display_index = total - pos
         for line in format_search_result(display_index, result):
             print(line)
+
+
+def format_update_candidate(index: int, candidate: UpdateCandidate) -> List[str]:
+    index_label = style(f"{index:>2})", CYAN)
+    name_part = style(candidate.name, BOLD)
+    current_version = candidate.installed_version or "?"
+    if candidate.target_version:
+        target_label = candidate.target_version
+    elif candidate.remote_head:
+        target_label = f"{candidate.remote_head[:7]}"
+    else:
+        target_label = "unknown"
+    change = f"{current_version} -> {target_label}"
+    meta_bits: List[str] = []
+    if candidate.remote_head and not candidate.target_version:
+        meta_bits.append("git commit")
+    line = f"{index_label} {name_part} {style(change, GREEN)}"
+    if meta_bits:
+        line += f" {style('[' + ', '.join(meta_bits) + ']', DIM)}"
+    return [line]
+
+
+def interactive_select_updates(candidates: Sequence[UpdateCandidate]) -> List[UpdateCandidate]:
+    if not candidates:
+        return []
+    prompt_text = style(
+        "Select packages to update (Enter for all, q to quit): ",
+        YELLOW,
+    )
+    total = len(candidates)
+    while True:
+        try:
+            raw = input(prompt_text)
+        except EOFError:
+            return list(candidates)
+        if not raw.strip():
+            return list(candidates)
+        parsed = parse_selection(raw, total)
+        if parsed is None:
+            print(style("Invalid selection. Please try again.", YELLOW))
+            continue
+        if not parsed:
+            return []
+        selected: List[UpdateCandidate] = []
+        for value in parsed:
+            index = value - 1
+            if index < 0 or index >= total:
+                selected = []
+                break
+            selected.append(candidates[index])
+        if not selected and parsed:
+            print(style("Invalid selection. Please try again.", YELLOW))
+            continue
+        return selected
 
 
 def parse_selection(selection: str, max_index: int) -> Optional[List[int]]:
