@@ -280,7 +280,25 @@ def ensure_clone(
         if package_dir.exists() and (package_dir / ".git").is_dir() and not force_reclone:
             if refresh:
                 run_command(["git", "-C", str(package_dir), "fetch", "origin"])
-                run_command(["git", "-C", str(package_dir), "reset", "--hard", "origin/HEAD"])
+                try:
+                    _reset_git_worktree(
+                        package_dir,
+                        (
+                            "origin/HEAD",
+                            "origin/master",
+                            "origin/main",
+                            f"origin/{package}",
+                        ),
+                    )
+                except AurGitError:
+                    if package_dir.exists():
+                        shutil.rmtree(package_dir)
+                    return ensure_clone(
+                        package,
+                        dest_root,
+                        refresh=False,
+                        force_reclone=True,
+                    )
             return package_dir
         if package_dir.exists():
             shutil.rmtree(package_dir)
@@ -289,7 +307,17 @@ def ensure_clone(
         if package_dir.exists() and (package_dir / ".git").is_dir() and not force_reclone:
             if refresh:
                 run_command(["git", "-C", str(package_dir), "fetch", "origin", package])
-                run_command(["git", "-C", str(package_dir), "reset", "--hard", f"origin/{package}"])
+                try:
+                    _reset_git_worktree(package_dir, (f"origin/{package}",))
+                except AurGitError:
+                    if package_dir.exists():
+                        shutil.rmtree(package_dir)
+                    return ensure_clone(
+                        package,
+                        dest_root,
+                        refresh=False,
+                        force_reclone=True,
+                    )
             return package_dir
         if package_dir.exists():
             shutil.rmtree(package_dir)
@@ -380,6 +408,65 @@ def _pkgbase_guesses(dep: str) -> List[str]:
         if candidate:
             guesses.append(candidate)
     return guesses
+
+
+def _parse_srcinfo_metadata(srcinfo_content: str) -> tuple[Optional[str], Optional[str]]:
+    pkgver = None
+    pkgrel = None
+    epoch = None
+    description = None
+    for raw_line in srcinfo_content.splitlines():
+        line = raw_line.strip()
+        if not line or "=" not in line:
+            continue
+        key, value = (part.strip() for part in line.split("=", 1))
+        if key == "pkgver" and not pkgver:
+            pkgver = value
+        elif key == "pkgrel" and not pkgrel:
+            pkgrel = value
+        elif key == "epoch" and not epoch:
+            epoch = value
+        elif key == "pkgdesc" and not description:
+            description = value
+    if pkgver or pkgrel or epoch:
+        version_parts: List[str] = []
+        if epoch and epoch not in {"", "0"}:
+            version_parts.append(f"{epoch}:")
+        if pkgver:
+            version_parts.append(pkgver)
+        if pkgrel and pkgver:
+            version_parts.append(f"-{pkgrel}")
+        version = "".join(version_parts) if version_parts else None
+    else:
+        version = None
+    return version, description
+
+
+def _reset_git_worktree(package_dir: Path, refs: Sequence[str]) -> None:
+    for ref in refs:
+        try:
+            run_command([
+                "git",
+                "-C",
+                str(package_dir),
+                "rev-parse",
+                "--verify",
+                ref,
+            ], capture=True)
+        except AurGitError:
+            continue
+        run_command([
+            "git",
+            "-C",
+            str(package_dir),
+            "reset",
+            "--hard",
+            ref,
+        ])
+        return
+    raise AurGitError(
+        f"Could not reset {package_dir.name} to any of: {', '.join(refs)}"
+    )
 
 
 def compute_match_score(
@@ -751,33 +838,9 @@ def git_srcinfo_metadata(package: str) -> Optional[tuple[str, Optional[str]]]:
     srcinfo = fetch_git_file(package, ".SRCINFO")
     if not srcinfo:
         return None
-    pkgver = None
-    pkgrel = None
-    epoch = None
-    description = None
-    for raw_line in srcinfo.splitlines():
-        line = raw_line.strip()
-        if not line or "=" not in line:
-            continue
-        key, value = (part.strip() for part in line.split("=", 1))
-        if key == "pkgver" and not pkgver:
-            pkgver = value
-        elif key == "pkgrel" and not pkgrel:
-            pkgrel = value
-        elif key == "epoch" and not epoch:
-            epoch = value
-        elif key == "pkgdesc" and not description:
-            description = value
-    if not pkgver and not description:
+    version, description = _parse_srcinfo_metadata(srcinfo)
+    if not version and not description:
         return None
-    version_parts: List[str] = []
-    if epoch and epoch not in {"", "0"}:
-        version_parts.append(f"{epoch}:")
-    if pkgver:
-        version_parts.append(pkgver)
-    if pkgrel and pkgver:
-        version_parts.append(f"-{pkgrel}")
-    version = "".join(version_parts) if version_parts else None
     return version, description
 
 
@@ -925,7 +988,6 @@ def update_packages(
     pending_updates: List[UpdateCandidate] = []
     for package, installed_version in candidates:
         if is_debug_package(package):
-            print(style(f"==> Skipping debug package {package}", DIM))
             continue
 
         remote_version: Optional[str] = None
@@ -948,7 +1010,6 @@ def update_packages(
             local_head = get_local_head(package_dir)
 
         if installed_version and remote_version and installed_version == remote_version:
-            print(style(f"==> {package} already up to date ({installed_version})", CYAN))
             continue
 
         if remote_head:
@@ -956,7 +1017,6 @@ def update_packages(
             if local_head is None:
                 local_head = get_local_head(package_dir)
             if local_head and local_head == remote_head:
-                print(style(f"==> {package} matches remote HEAD (skipping build)", CYAN))
                 continue
 
         pending_updates.append(
@@ -970,32 +1030,14 @@ def update_packages(
         )
 
     if not pending_updates:
+        print("All packages are up to date.")
         if missing:
             source_label = "AUR RPC" if USE_AUR_RPC else "AUR mirror"
             for package in missing:
-                if is_debug_package(package):
-                    continue
                 print(f"note: {package} is not available via {source_label}", file=sys.stderr)
-        else:
-            print(style("All monitored packages are up to date.", CYAN))
         return
 
-    print(style("Packages with available updates:", CYAN))
     for index, candidate in enumerate(pending_updates, start=1):
-        for line in format_update_candidate(index, candidate):
-            print(line)
-
-    interactive = sys.stdin.isatty() and sys.stdout.isatty()
-    if interactive:
-        selected_candidates = interactive_select_updates(pending_updates)
-        if not selected_candidates:
-            print(style("No packages selected.", DIM))
-            return
-    else:
-        selected_candidates = pending_updates
-
-    print(style("Updating selected packages:", CYAN))
-    for candidate in selected_candidates:
         from_version = candidate.installed_version or "?"
         if candidate.target_version:
             to_version = candidate.target_version
@@ -1003,8 +1045,15 @@ def update_packages(
             to_version = candidate.remote_head[:7]
         else:
             to_version = "unknown"
-        label = style(candidate.name, BOLD)
-        print(f"  {label} {style(f'{from_version} -> {to_version}', GREEN)}")
+        print(f"{index}) {candidate.name} {from_version} -> {to_version}")
+
+    interactive = sys.stdin.isatty() and sys.stdout.isatty()
+    if interactive:
+        selected_candidates = interactive_select_updates(pending_updates)
+        if not selected_candidates:
+            return
+    else:
+        selected_candidates = pending_updates
 
     shared_visited: Set[str] = set()
     for candidate in selected_candidates:
