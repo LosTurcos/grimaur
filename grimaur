@@ -25,6 +25,7 @@ from typing import Iterable, List, Optional, Sequence, Set
 
 AUR_REMOTE = "https://github.com/archlinux/aur.git"
 GITHUB_RAW_BASE = "https://raw.githubusercontent.com/archlinux/aur"
+_VCS_SUFFIXES = ("-git", "-vcs", "-svn", "-hg", "-bzr", "-darcs", "-cvs")
 
 RESET = "\033[0m"
 BOLD = "\033[1m"
@@ -55,6 +56,10 @@ def prompt_confirm(message: str) -> bool:
 
 def is_debug_package(name: str) -> bool:
     return name.endswith("-debug")
+
+
+def is_vcs_package(name: str) -> bool:
+    return any(name.endswith(suffix) for suffix in _VCS_SUFFIXES)
 
 
 class AurGitError(RuntimeError):
@@ -557,6 +562,9 @@ def update_packages(
         meta = git_srcinfo_metadata(package)
         if meta:
             remote_version = meta[0]
+
+        if remote_version and is_vcs_package(package):
+            remote_version = None
 
         if remote_version is None:
             remote_head = get_remote_head(package)
