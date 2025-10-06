@@ -3,18 +3,20 @@
 `grimaur` is a lightweight AUR helper that searches, builds, and updates AUR packages using the official git mirror.
 
 ## Install
-1. Clone the repository:
+### Directly from the AUR
    ```bash
-   git clone https://github.com/ryk4rd/grimaur.git
-2. Put the script somewhere on your `PATH`:
-   ```bash
-   chmod +x grimaur
-   sudo install -m755 grimaur /usr/local/bin/grimaur
+   git clone https://aur.archlinux.org/grimaur-git.git
+   cd grimaur-git
+   makepkg -si
    ```
-3. (Optional) Enable Bash completions:
+
+### From the git mirror
    ```bash
-   sudo install -m644 aur-completion.bash /usr/share/bash-completion/completions/grimaur
+   git clone --branch grimaur-git --single-branch https://github.com/archlinux/aur.git grimaur-git
+   cd grimaur-git
+   makepkg -si
    ```
+   
 
 ## Search Packages
 - `grimaur <term>` (or `grimaur search <term>`) lists matching packages and lets you pick one to install.
