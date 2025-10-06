@@ -1,18 +1,16 @@
 #!/usr/bin/env python3
-"""aurgit: Fetch, inspect, search, update, and install Arch Linux AUR packages via git or the RPC API.
+"""grimaur: Fetch, inspect, search, update, and install Arch Linux AUR packages via git.
 
 This tool clones branches from https://github.com/archlinux/aur.git where each package
 is stored on its own branch. It can recursively resolve and install dependencies by
 building packages locally with makepkg. Official repository dependencies are installed
-with pacman when they are missing. The search command can also query the official AUR
-RPC interface to display package metadata such as description, votes, and orphaned status.
+with pacman when they are missing.
 
 Requirements: git, makepkg, pacman, and (for installing official packages) sudo/root.
 """
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import re
 import shutil
@@ -26,7 +24,6 @@ from pathlib import Path
 from typing import Iterable, List, Optional, Sequence, Set
 
 AUR_REMOTE = "https://github.com/archlinux/aur.git"
-AUR_RPC_URL = "https://aur.archlinux.org/rpc/?v=5"
 GITHUB_RAW_BASE = "https://raw.githubusercontent.com/archlinux/aur"
 
 RESET = "\033[0m"
@@ -83,11 +80,6 @@ class SearchResult:
     description: Optional[str]
     installed: bool
     score: int
-    source: str
-    popularity: Optional[float] = None
-    votes: Optional[int] = None
-    maintainer: Optional[str] = None
-    out_of_date: Optional[bool] = None
 
 
 def run_command(
@@ -283,55 +275,27 @@ def exists_in_sync_repo(package: str) -> bool:
     return _pacman_returns_zero(["pacman", "-Si", package])
 
 
-def aur_rpc_call(params: Sequence[tuple[str, str]]) -> dict:
-    query = urllib.parse.urlencode(params, doseq=True)
-    url = f"{AUR_RPC_URL}&{query}" if query else AUR_RPC_URL
+def resolve_official_dependency(dep: str) -> Optional[str]:
+    """Return the repo package that satisfies dep, accounting for providers."""
+    if exists_in_sync_repo(dep):
+        return dep
     try:
-        with urllib.request.urlopen(url, timeout=10) as response:
-            payload = response.read().decode()
-    except urllib.error.URLError as exc:
-        raise AurGitError(f"Failed to contact AUR RPC: {exc}") from exc
-    try:
-        data = json.loads(payload)
-    except json.JSONDecodeError as exc:
-        raise AurGitError("Received invalid JSON from AUR RPC") from exc
-    if data.get("type") == "error":
-        raise AurGitError(f"AUR RPC error: {data.get('error', 'unknown error')}")
-    return data
-
-
-def aur_api_search(pattern: str) -> List[dict]:
-    data = aur_rpc_call([
-        ("type", "search"),
-        ("arg", pattern),
-    ])
-    return list(data.get("results", []))
-
-
-def aur_api_info(package: str) -> Optional[dict]:
-    data = aur_rpc_call([
-        ("type", "info"),
-        ("arg", package),
-    ])
-    results = data.get("results", [])
-    if not results:
+        output = run_command(
+            [
+                "pacman",
+                "-Sp",
+                "--print-format",
+                "%n",
+                dep,
+            ],
+            capture=True,
+        )
+    except AurGitError:
         return None
-    return results[0]
-
-
-def aur_api_info_multi(packages: Sequence[str]) -> dict[str, dict]:
-    if not packages:
-        return {}
-    params: List[tuple[str, str]] = [("type", "info")]
-    for pkg in packages:
-        params.append(("arg[]", pkg))
-    data = aur_rpc_call(params)
-    info: dict[str, dict] = {}
-    for entry in data.get("results", []):
-        name = entry.get("Name")
-        if name:
-            info[name] = entry
-    return info
+    providers = [line.strip() for line in str(output).splitlines() if line.strip()]
+    if not providers:
+        return None
+    return providers[0]
 
 
 def exists_in_aur_mirror(package: str) -> bool:
@@ -345,12 +309,9 @@ def exists_in_aur_mirror(package: str) -> bool:
             AUR_REMOTE,
             package,
         ], capture=True)
-        if str(output).strip():
-            return True
     except AurGitError:
-        pass
-    info = aur_api_info(package)
-    return info is not None
+        return False
+    return bool(str(output).strip())
 
 
 def list_foreign_packages() -> dict[str, str]:
@@ -517,10 +478,16 @@ def install_package(
             continue
         if is_installed(dep):
             continue
-        if exists_in_sync_repo(dep):
-            missing_official.add(dep)
-        else:
+        provider = resolve_official_dependency(dep)
+        if provider:
+            if is_installed(provider):
+                continue
+            missing_official.add(provider)
+            continue
+        if exists_in_aur_mirror(dep):
             aur_dependencies.add(dep)
+        else:
+            missing_official.add(dep)
 
     if missing_official:
         install_official_packages(missing_official, noconfirm=noconfirm)
@@ -550,7 +517,6 @@ def update_packages(
     refresh: bool,
     noconfirm: bool,
     targets: Optional[Sequence[str]] = None,
-    source: str = "git",
 ) -> None:
     candidates: List[tuple[str, Optional[str]]]
     if targets:
@@ -576,19 +542,10 @@ def update_packages(
 
         remote_version: Optional[str] = None
         remote_head: Optional[str] = None
-        info: Optional[dict] = None
 
-        if source == "api":
-            try:
-                info = aur_api_info(package)
-            except AurGitError as exc:
-                print(f"warning: could not query AUR API for {package} ({exc})", file=sys.stderr)
-            if info:
-                remote_version = info.get("Version")
-        else:
-            meta = git_srcinfo_metadata(package)
-            if meta:
-                remote_version = meta[0]
+        meta = git_srcinfo_metadata(package)
+        if meta:
+            remote_version = meta[0]
 
         if remote_version is None:
             remote_head = get_remote_head(package)
@@ -662,59 +619,8 @@ def search_packages_git(
                 description=description,
                 installed=package in installed_set,
                 score=score,
-                source="git",
             )
         )
-    return results
-
-
-def search_packages_api(
-    pattern: str,
-    *,
-    needle: Optional[str],
-    limit: Optional[int],
-) -> List[SearchResult]:
-    entries = aur_api_search(pattern)
-    installed_set = installed_package_set()
-    results: List[SearchResult] = []
-    for entry in entries:
-        name = entry.get("Name")
-        if not name:
-            continue
-        score = compute_match_score(name, regex=None, needle=needle)
-        if score is None:
-            continue
-        version = entry.get("Version")
-        description = entry.get("Description")
-        popularity_raw = entry.get("Popularity")
-        votes_raw = entry.get("NumVotes")
-        maintainer = entry.get("Maintainer")
-        out_of_date = entry.get("OutOfDate")
-        try:
-            popularity_val = float(popularity_raw) if popularity_raw is not None else None
-        except (TypeError, ValueError):
-            popularity_val = None
-        try:
-            votes_val = int(votes_raw) if votes_raw is not None else None
-        except (TypeError, ValueError):
-            votes_val = None
-        results.append(
-            SearchResult(
-                name=name,
-                version=version,
-                description=description,
-                installed=name in installed_set,
-                score=score,
-                source="api",
-                popularity=popularity_val,
-                votes=votes_val,
-                maintainer=maintainer if maintainer else None,
-                out_of_date=bool(out_of_date) if out_of_date not in (None, 0) else False,
-            )
-        )
-    results.sort(key=lambda result: (result.score, result.name))
-    if limit is not None and limit >= 0:
-        results = results[:limit]
     return results
 
 
@@ -730,20 +636,7 @@ def format_search_result(index: int, result: SearchResult) -> List[str]:
         main_parts.append(style(result.version, GREEN))
     if result.installed:
         main_parts.append(style("[installed]", GREEN))
-    meta_bits: List[str] = []
-    if result.source == "api":
-        if result.popularity is not None:
-            meta_bits.append(f"pop {result.popularity:.2f}")
-        if result.votes is not None:
-            meta_bits.append(f"votes {result.votes}")
-        if result.maintainer:
-            meta_bits.append(f"maintainer {result.maintainer}")
-        else:
-            meta_bits.append("orphaned")
-        if result.out_of_date:
-            meta_bits.append("out-of-date")
-    else:
-        meta_bits.append("git mirror")
+    meta_bits: List[str] = ["git mirror"]
     line = f"{index_label} {' '.join(main_parts)}"
     if meta_bits:
         line += f" {style('[' + ', '.join(meta_bits) + ']', DIM)}"
@@ -850,28 +743,6 @@ def complete_packages_git(prefix: str, limit: int) -> List[str]:
     return names
 
 
-def complete_packages_api(prefix: str, limit: int) -> List[str]:
-    prefix = prefix.strip()
-    if not prefix:
-        return []
-    try:
-        entries = aur_api_search(prefix)
-    except AurGitError:
-        return []
-    lowered_prefix = prefix.lower()
-    names: List[str] = []
-    for entry in entries:
-        name = entry.get("Name")
-        if not name:
-            continue
-        if not name.lower().startswith(lowered_prefix):
-            continue
-        names.append(name)
-        if len(names) >= limit:
-            break
-    return names
-
-
 def inspect_package(
     package: str,
     dest_root: Path,
@@ -931,7 +802,7 @@ def fetch_package(package: str, dest_root: Path, *, refresh: bool, force: bool) 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Work with AUR packages via the official git mirror and AUR RPC API"
+        description="Work with AUR packages via the official git mirror"
     )
     parser.add_argument(
         "--dest-root",
@@ -944,13 +815,6 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Disable coloured output",
     )
-    parser.add_argument(
-        "--source",
-        choices=["git", "api"],
-        default="git",
-        help="Preferred upstream source (default: git)",
-    )
-
     subparsers = parser.add_subparsers(dest="command")
 
     fetch_parser = subparsers.add_parser("fetch", help="Clone the package branch locally")
@@ -971,23 +835,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="Specific foreign package names to update (default: all from pacman -Qm)",
     )
     update_parser.add_argument("--noconfirm", action="store_true", help="Pass --noconfirm to pacman/makepkg")
-    update_parser.add_argument(
-        "--source",
-        choices=["git", "api"],
-        dest="update_source",
-        help="Override global --source for update checks",
-    )
-
-    search_parser = subparsers.add_parser("search", help="Search packages via git mirror or AUR API")
+    search_parser = subparsers.add_parser("search", help="Search packages via the git mirror")
     search_parser.add_argument("pattern", help="Substring or regex to match against package names")
     search_parser.add_argument("--regex", action="store_true", help="Treat the pattern as a regular expression")
     search_parser.add_argument("--limit", type=int, help="Limit results to the first N matches")
-    search_parser.add_argument(
-        "--source",
-        choices=["git", "api"],
-        dest="search_source",
-        help="Search backend to use (default inherits from global --source)",
-    )
     search_parser.add_argument(
         "--no-interactive",
         action="store_true",
@@ -1002,11 +853,6 @@ def build_parser() -> argparse.ArgumentParser:
     complete_parser = subparsers.add_parser("complete", help=argparse.SUPPRESS)
     complete_parser.add_argument("subcommand", choices=["install"])
     complete_parser.add_argument("prefix", nargs="?", default="")
-    complete_parser.add_argument(
-        "--source",
-        choices=["git", "api"],
-        help="Source to use when completing package names",
-    )
     complete_parser.add_argument(
         "--limit",
         type=int,
@@ -1042,8 +888,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     dest_root = Path(os.path.expanduser(args.dest_root)).resolve()
     refresh: bool = bool(args.refresh)
-    global_source: str = getattr(args, "source", "git")
-
     if args.command is None:
         parser.print_help()
         return 0
@@ -1067,33 +911,24 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 refresh=True,
                 noconfirm=args.noconfirm,
                 targets=args.packages,
-                source=getattr(args, "update_source", None) or global_source,
             )
         elif args.command == "search":
-            search_source = getattr(args, "search_source", None) or global_source
             regex_obj: Optional[re.Pattern] = None
             needle: Optional[str] = None
-            if search_source == "api":
-                if args.regex:
-                    print("error: --regex is not supported when using --source api", file=sys.stderr)
+            if args.regex:
+                try:
+                    regex_obj = re.compile(args.pattern)
+                except re.error as exc:
+                    print(f"error: invalid regular expression: {exc}", file=sys.stderr)
                     return 1
-                needle = args.pattern.lower()
-                results = search_packages_api(args.pattern, needle=needle, limit=args.limit)
             else:
-                if args.regex:
-                    try:
-                        regex_obj = re.compile(args.pattern)
-                    except re.error as exc:
-                        print(f"error: invalid regular expression: {exc}", file=sys.stderr)
-                        return 1
-                else:
-                    needle = args.pattern.lower()
-                results = search_packages_git(
-                    args.pattern,
-                    regex=regex_obj,
-                    needle=needle,
-                    limit=args.limit,
-                )
+                needle = args.pattern.lower()
+            results = search_packages_git(
+                args.pattern,
+                regex=regex_obj,
+                needle=needle,
+                limit=args.limit,
+            )
             if not results:
                 print("No matches found", file=sys.stderr)
                 return 1
@@ -1139,15 +974,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     print(f"error installing {item.name}: {exc}", file=sys.stderr)
             return exit_code
         elif args.command == "complete":
-            source = getattr(args, "source", None) or global_source
             prefix = args.prefix
             limit = max(1, args.limit)
             names: List[str] = []
             if args.subcommand == "install":
-                if source == "api":
-                    names = complete_packages_api(prefix, limit)
-                else:
-                    names = complete_packages_git(prefix, limit)
+                names = complete_packages_git(prefix, limit)
             for name in names:
                 print(name)
             return 0
