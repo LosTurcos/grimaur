@@ -8,7 +8,7 @@
    git clone https://github.com/ryk4rd/grimaur.git
 2. Put the script somewhere on your `PATH`:
    ```bash
-   chmod +x aur
+   chmod +x grimaur
    sudo install -m755 grimaur /usr/local/bin/grimaur
    ```
 3. (Optional) Enable Bash completions:
