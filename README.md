@@ -1,6 +1,6 @@
 # grimaur
 
-`grimaur` is a lightweight AUR helper that searches, builds, and updates AUR packages using the official git mirror.
+`grimaur` is a lightweight AUR helper that searches, builds, and updates AUR packages. It talks to the AUR RPC API by default and automatically falls back to the official git mirror when the endpoint is unavailable. Pass `--git-mirror` if you prefer to force the mirror.
 
 ## Install
 ### Directly from the AUR

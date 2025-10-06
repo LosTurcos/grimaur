@@ -1,16 +1,19 @@
 #!/usr/bin/env python3
-"""grimaur: Fetch, inspect, search, update, and install Arch Linux AUR packages via git.
+"""grimaur: Fetch, inspect, search, update, and install Arch Linux AUR packages.
 
-This tool clones branches from https://github.com/archlinux/aur.git where each package
-is stored on its own branch. It can recursively resolve and install dependencies by
-building packages locally with makepkg. Official repository dependencies are installed
-with pacman when they are missing.
+By default this tool queries the official AUR RPC API and automatically falls back to
+the git mirror at https://github.com/archlinux/aur.git when the endpoint is
+unavailable. Each package lives on its own branch in the mirror, and grimaur can
+recursively resolve and install dependencies by building packages locally with
+makepkg. Official repository dependencies are installed with pacman when they are
+missing.
 
 Requirements: git, makepkg, pacman, and (for installing official packages) sudo/root.
 """
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import shutil
@@ -21,9 +24,12 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, List, Optional, Sequence, Set
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set
 
 AUR_REMOTE = "https://github.com/archlinux/aur.git"
+OFFICIAL_AUR_GIT_BASE = "https://aur.archlinux.org"
+CGIT_RAW_BASE = "https://aur.archlinux.org/cgit/aur.git/plain"
+AUR_RPC_ENDPOINT = "https://aur.archlinux.org/rpc/"
 GITHUB_RAW_BASE = "https://raw.githubusercontent.com/archlinux/aur"
 _VCS_SUFFIXES = ("-git", "-vcs", "-svn", "-hg", "-bzr", "-darcs", "-cvs")
 
@@ -35,9 +41,13 @@ YELLOW = "\033[33m"
 DIM = "\033[2m"
 
 USE_COLOR = False
+USE_AUR_RPC = False
+FORCE_GIT_MIRROR = False
 _INSTALLED_CACHE: Optional[Set[str]] = None
 _PROVIDES_CACHE: dict[str, Optional[Set[str]]] = {}
 _VIRTUAL_PROVIDER_CACHE: dict[str, Optional[str]] = {}
+_AUR_INFO_CACHE: dict[str, Optional[dict]] = {}
+_RPC_FALLBACK_NOTIFIED = False
 
 _COMMON_AUR_SUFFIXES = ("-bin",)
 
@@ -46,6 +56,20 @@ def style(text: str, *codes: str) -> str:
     if not USE_COLOR or not codes:
         return text
     return "".join(codes) + text + RESET
+
+
+def disable_aur_rpc(reason: str) -> None:
+    """Switch to the git mirror backend when the RPC endpoint fails."""
+    global USE_AUR_RPC, _RPC_FALLBACK_NOTIFIED
+    if FORCE_GIT_MIRROR or not USE_AUR_RPC:
+        return
+    USE_AUR_RPC = False
+    if _RPC_FALLBACK_NOTIFIED:
+        return
+    summary = reason.strip().splitlines()[0] if reason else "unknown error"
+    message = f"AUR RPC unavailable ({summary}); falling back to git mirror."
+    print(style(message, YELLOW), file=sys.stderr)
+    _RPC_FALLBACK_NOTIFIED = True
 
 
 def prompt_confirm(message: str) -> bool:
@@ -89,6 +113,8 @@ class SearchResult:
     description: Optional[str]
     installed: bool
     score: int
+    votes: Optional[int] = None
+    is_orphan: Optional[bool] = None
 
 
 @dataclass(frozen=True)
@@ -98,6 +124,105 @@ class UpdateCandidate:
     target_version: Optional[str]
     remote_head: Optional[str]
     local_head: Optional[str]
+
+
+def aur_rpc_call(params: Dict[str, Any]) -> Dict[str, Any]:
+    query_params: Dict[str, Any] = {"v": "5"}
+    query_params.update(params)
+    query = urllib.parse.urlencode(query_params, doseq=True)
+    url = f"{AUR_RPC_ENDPOINT}?{query}"
+    try:
+        with urllib.request.urlopen(url, timeout=10) as response:
+            status = response.getcode()
+            if status != 200:
+                disable_aur_rpc(f"status {status}")
+                raise AurGitError(f"AUR RPC request failed with status {status}")
+            payload = response.read()
+    except urllib.error.URLError as exc:
+        disable_aur_rpc(str(exc))
+        raise AurGitError(f"Failed to contact AUR RPC: {exc}") from exc
+    except Exception as exc:  # pragma: no cover - unexpected transport issues
+        disable_aur_rpc(str(exc))
+        raise AurGitError(f"Failed to contact AUR RPC: {exc}") from exc
+    try:
+        data = json.loads(payload.decode())
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        disable_aur_rpc("invalid JSON payload")
+        raise AurGitError("Failed to decode AUR RPC response") from exc
+    if data.get("type") == "error":
+        raise AurGitError(str(data.get("error") or "Unknown AUR RPC error"))
+    return data
+
+
+def aur_rpc_info(package: str) -> Optional[dict]:
+    if package in _AUR_INFO_CACHE:
+        return _AUR_INFO_CACHE[package]
+    try:
+        data = aur_rpc_call({"type": "info", "arg[]": [package]})
+    except AurGitError:
+        _AUR_INFO_CACHE[package] = None
+        return None
+    results = data.get("results")
+    match: Optional[dict] = None
+    if isinstance(results, list):
+        for entry in results:
+            if isinstance(entry, dict) and entry.get("Name") == package:
+                match = entry
+                break
+        if match is None:
+            for entry in results:
+                if isinstance(entry, dict) and entry.get("PackageBase") == package:
+                    match = entry
+                    break
+    _AUR_INFO_CACHE[package] = match
+    return match
+
+
+def dependency_set_from_rpc(info: dict) -> DependencySet:
+    def gather(key: str, normalize: bool = True) -> Set[str]:
+        values: Set[str] = set()
+        items = info.get(key)
+        if not isinstance(items, list):
+            return values
+        for item in items:
+            if not isinstance(item, str):
+                continue
+            entry = _normalize_dep(item) if normalize else item.strip()
+            if entry:
+                values.add(entry)
+        return values
+
+    depends = gather("Depends")
+    makedepends = gather("MakeDepends")
+    checkdepends = gather("CheckDepends")
+    optdepends = gather("OptDepends", normalize=False)
+    return DependencySet(depends, makedepends, checkdepends, optdepends)
+
+
+def aur_rpc_search_results(pattern: str) -> List[dict]:
+    try:
+        data = aur_rpc_call({"type": "search", "arg": pattern})
+    except AurGitError:
+        return []
+    results = data.get("results")
+    if not isinstance(results, list):
+        return []
+    return [entry for entry in results if isinstance(entry, dict)]
+
+
+def aur_rpc_suggest(prefix: str) -> List[str]:
+    try:
+        data = aur_rpc_call({"type": "suggest", "arg": prefix})
+    except AurGitError:
+        return []
+    results = data.get("results")
+    if not isinstance(results, list):
+        return []
+    suggestions: List[str] = []
+    for entry in results:
+        if isinstance(entry, str):
+            suggestions.append(entry)
+    return suggestions
 
 
 def run_command(
@@ -150,12 +275,23 @@ def ensure_clone(
                 "Use --force to overwrite."
             )
 
-    if package_dir.exists() and (package_dir / ".git").is_dir():
-        if refresh:
-            run_command(["git", "-C", str(package_dir), "fetch", "origin", package])
-            run_command(["git", "-C", str(package_dir), "reset", "--hard", f"origin/{package}"])
+    if USE_AUR_RPC:
+        remote_url = f"{OFFICIAL_AUR_GIT_BASE}/{package}.git"
+        if package_dir.exists() and (package_dir / ".git").is_dir() and not force_reclone:
+            if refresh:
+                run_command(["git", "-C", str(package_dir), "fetch", "origin"])
+                run_command(["git", "-C", str(package_dir), "reset", "--hard", "origin/HEAD"])
+            return package_dir
+        if package_dir.exists():
+            shutil.rmtree(package_dir)
+        run_command(["git", "clone", remote_url, str(package_dir)])
     else:
-        if force_reclone and package_dir.exists():
+        if package_dir.exists() and (package_dir / ".git").is_dir() and not force_reclone:
+            if refresh:
+                run_command(["git", "-C", str(package_dir), "fetch", "origin", package])
+                run_command(["git", "-C", str(package_dir), "reset", "--hard", f"origin/{package}"])
+            return package_dir
+        if package_dir.exists():
             shutil.rmtree(package_dir)
         run_command(
             [
@@ -321,11 +457,36 @@ def is_dependency_satisfied(dep: str) -> bool:
 def package_provides(package: str) -> Optional[Set[str]]:
     if package in _PROVIDES_CACHE:
         return _PROVIDES_CACHE[package]
+    provides: Set[str] = set()
+    info: Optional[dict] = None
+    if USE_AUR_RPC:
+        info = aur_rpc_info(package)
+        if info:
+            name = info.get("Name")
+            if isinstance(name, str):
+                normalized = _normalize_dep(name)
+                if normalized:
+                    provides.add(normalized)
+            pkgbase_value = info.get("PackageBase")
+            if isinstance(pkgbase_value, str):
+                normalized = _normalize_dep(pkgbase_value)
+                if normalized:
+                    provides.add(normalized)
+            rpc_provides = info.get("Provides")
+            if isinstance(rpc_provides, list):
+                for value in rpc_provides:
+                    if not isinstance(value, str):
+                        continue
+                    normalized = _normalize_dep(value)
+                    if normalized:
+                        provides.add(normalized)
     srcinfo = fetch_git_file(package, ".SRCINFO")
     if not srcinfo:
-        _PROVIDES_CACHE[package] = None
-        return None
-    provides: Set[str] = set()
+        if not provides:
+            _PROVIDES_CACHE[package] = None
+            return None
+        _PROVIDES_CACHE[package] = provides
+        return provides
     for raw_line in srcinfo.splitlines():
         line = raw_line.strip()
         if not line or "=" not in line:
@@ -340,6 +501,10 @@ def package_provides(package: str) -> Optional[Set[str]]:
 
 
 def _search_aur_candidates(dep: str, *, limit: int = 25) -> List[str]:
+    if USE_AUR_RPC:
+        results = _search_aur_candidates_rpc(dep, limit=limit)
+        if results or USE_AUR_RPC:
+            return results
     patterns = [
         f"refs/heads/{dep}",
         f"refs/heads/{dep}-*",
@@ -370,6 +535,24 @@ def _search_aur_candidates(dep: str, *, limit: int = 25) -> List[str]:
             if len(results) >= limit:
                 return results
     return results
+
+
+def _search_aur_candidates_rpc(dep: str, *, limit: int) -> List[str]:
+    results = aur_rpc_search_results(dep)
+    seen: Set[str] = set()
+    names: List[str] = []
+    for entry in results:
+        for key in ("Name", "PackageBase"):
+            value = entry.get(key)
+            if not isinstance(value, str):
+                continue
+            if value in seen:
+                continue
+            seen.add(value)
+            names.append(value)
+            if len(names) >= limit:
+                return names
+    return names
 
 
 def resolve_aur_dependency(dep: str) -> Optional[str]:
@@ -445,6 +628,12 @@ def resolve_official_dependency(dep: str) -> Optional[str]:
 def exists_in_aur_mirror(package: str) -> bool:
     if is_debug_package(package):
         return True
+    if USE_AUR_RPC:
+        info = aur_rpc_info(package)
+        if info:
+            return True
+        if USE_AUR_RPC:
+            return False
     try:
         output = run_command([
             "git",
@@ -484,20 +673,34 @@ def get_local_head(package_dir: Path) -> Optional[str]:
 
 def get_remote_head(package: str) -> Optional[str]:
     try:
-        output = run_command([
-            "git",
-            "ls-remote",
-            "--heads",
-            AUR_REMOTE,
-            package,
-        ], capture=True)
+        if USE_AUR_RPC:
+            output = run_command(
+                [
+                    "git",
+                    "ls-remote",
+                    f"{OFFICIAL_AUR_GIT_BASE}/{package}.git",
+                    "HEAD",
+                ],
+                capture=True,
+            )
+        else:
+            output = run_command(
+                [
+                    "git",
+                    "ls-remote",
+                    "--heads",
+                    AUR_REMOTE,
+                    package,
+                ],
+                capture=True,
+            )
     except AurGitError:
         return None
     for line in str(output).splitlines():
         parts = line.split()
-        if len(parts) != 2:
+        if not parts:
             continue
-        sha, _ = parts
+        sha = parts[0]
         if sha:
             return sha
     return None
@@ -518,7 +721,10 @@ def get_installed_version(package: str) -> Optional[str]:
 def fetch_git_file(package: str, path: str) -> Optional[str]:
     safe_package = urllib.parse.quote(package)
     safe_path = path.lstrip("/")
-    url = f"{GITHUB_RAW_BASE}/{safe_package}/{safe_path}"
+    if USE_AUR_RPC:
+        url = f"{CGIT_RAW_BASE}/{safe_path}?h={safe_package}"
+    else:
+        url = f"{GITHUB_RAW_BASE}/{safe_package}/{safe_path}"
     try:
         with urllib.request.urlopen(url, timeout=10) as response:
             if response.status != 200:
@@ -533,6 +739,15 @@ def fetch_git_file(package: str, path: str) -> Optional[str]:
 
 
 def git_srcinfo_metadata(package: str) -> Optional[tuple[str, Optional[str]]]:
+    if USE_AUR_RPC:
+        info = aur_rpc_info(package)
+        if not info:
+            return None
+        version = info.get("Version")
+        description = info.get("Description")
+        if isinstance(version, str) or isinstance(description, str):
+            return (version if isinstance(version, str) else None, description if isinstance(description, str) else None)
+        # fallback to raw .SRCINFO if fields missing
     srcinfo = fetch_git_file(package, ".SRCINFO")
     if not srcinfo:
         return None
@@ -607,9 +822,19 @@ def install_package(
         return
     visited.add(package)
 
-    package_dir = ensure_clone(package, dest_root, refresh=refresh)
-    srcinfo = read_srcinfo(package_dir)
-    _, pkgdesc, deps = parse_dependencies(srcinfo)
+    package_dir: Optional[Path] = None
+    info: Optional[dict] = None
+    if USE_AUR_RPC:
+        info = aur_rpc_info(package)
+        if info is None and USE_AUR_RPC:
+            raise AurGitError(f"Package '{package}' not found via AUR RPC")
+    if info:
+        pkgdesc = info.get("Description") if isinstance(info.get("Description"), str) else None
+        deps = dependency_set_from_rpc(info)
+    else:
+        package_dir = ensure_clone(package, dest_root, refresh=refresh)
+        srcinfo = read_srcinfo(package_dir)
+        _, pkgdesc, deps = parse_dependencies(srcinfo)
     if pkgdesc:
         print(f"==> {package}: {pkgdesc}")
     else:
@@ -666,6 +891,9 @@ def install_package(
             noconfirm=noconfirm,
             visited=visited,
         )
+
+    if package_dir is None:
+        package_dir = ensure_clone(package, dest_root, refresh=refresh)
 
     build_and_install(package_dir, noconfirm=noconfirm)
 
@@ -743,10 +971,11 @@ def update_packages(
 
     if not pending_updates:
         if missing:
+            source_label = "AUR RPC" if USE_AUR_RPC else "AUR mirror"
             for package in missing:
                 if is_debug_package(package):
                     continue
-                print(f"note: {package} is not in the AUR mirror", file=sys.stderr)
+                print(f"note: {package} is not available via {source_label}", file=sys.stderr)
         else:
             print(style("All monitored packages are up to date.", CYAN))
         return
@@ -793,7 +1022,32 @@ def update_packages(
     for package in missing:
         if is_debug_package(package):
             continue
-        print(f"note: {package} is not in the AUR mirror", file=sys.stderr)
+        source_label = "AUR RPC" if USE_AUR_RPC else "AUR mirror"
+        print(f"note: {package} is not available via {source_label}", file=sys.stderr)
+
+
+def search_packages(
+    pattern: str,
+    *,
+    regex: Optional[re.Pattern],
+    needle: Optional[str],
+    limit: Optional[int],
+) -> List[SearchResult]:
+    if USE_AUR_RPC:
+        results = search_packages_rpc(
+            pattern,
+            regex=regex,
+            needle=needle,
+            limit=limit,
+        )
+        if results or USE_AUR_RPC:
+            return results
+    return search_packages_git(
+        pattern,
+        regex=regex,
+        needle=needle,
+        limit=limit,
+    )
 
 
 def search_packages_git(
@@ -840,6 +1094,57 @@ def search_packages_git(
     return results
 
 
+def search_packages_rpc(
+    pattern: str,
+    *,
+    regex: Optional[re.Pattern],
+    needle: Optional[str],
+    limit: Optional[int],
+) -> List[SearchResult]:
+    raw_results = aur_rpc_search_results(pattern)
+    candidates: List[tuple[int, dict]] = []
+    for entry in raw_results:
+        name = entry.get("Name")
+        if not isinstance(name, str):
+            continue
+        score = compute_match_score(name, regex=regex, needle=needle)
+        if score is None:
+            continue
+        candidates.append((score, entry))
+    candidates.sort(key=lambda item: (item[0], item[1].get("Name", "")))
+    if limit is not None and limit >= 0:
+        candidates = candidates[:limit]
+    installed_set = installed_package_set()
+    results: List[SearchResult] = []
+    for score, entry in candidates:
+        name_value = entry.get("Name")
+        if not isinstance(name_value, str):
+            continue
+        version = entry.get("Version") if isinstance(entry.get("Version"), str) else None
+        description = entry.get("Description") if isinstance(entry.get("Description"), str) else None
+        votes = None
+        votes_value = entry.get("NumVotes")
+        if isinstance(votes_value, (int, float, str)):
+            try:
+                votes = int(votes_value)
+            except (TypeError, ValueError):
+                votes = None
+        maintainer = entry.get("Maintainer")
+        is_orphan = maintainer in (None, "")
+        results.append(
+            SearchResult(
+                name=name_value,
+                version=version,
+                description=description,
+                installed=name_value in installed_set,
+                score=score,
+                votes=votes,
+                is_orphan=is_orphan,
+            )
+        )
+    return results
+
+
 def order_search_results(results: Sequence[SearchResult]) -> List[SearchResult]:
     # Lower score = better match; return ascending order (best last when reversed later).
     return sorted(results, key=lambda result: (result.score, result.name))
@@ -852,7 +1157,14 @@ def format_search_result(index: int, result: SearchResult) -> List[str]:
         main_parts.append(style(result.version, GREEN))
     if result.installed:
         main_parts.append(style("[installed]", GREEN))
-    meta_bits: List[str] = ["git mirror"]
+    if USE_AUR_RPC:
+        meta_bits: List[str] = ["aur rpc"]
+        if result.votes is not None:
+            meta_bits.append(f"{result.votes} votes")
+        if result.is_orphan:
+            meta_bits.append("orphan")
+    else:
+        meta_bits = ["git mirror"]
     line = f"{index_label} {' '.join(main_parts)}"
     if meta_bits:
         line += f" {style('[' + ', '.join(meta_bits) + ']', DIM)}"
@@ -986,6 +1298,14 @@ def interactive_select_results(results: Sequence[SearchResult]) -> List[SearchRe
         return selected
 
 
+def complete_packages(prefix: str, limit: int) -> List[str]:
+    if USE_AUR_RPC:
+        names = complete_packages_rpc(prefix, limit)
+        if names or USE_AUR_RPC:
+            return names
+    return complete_packages_git(prefix, limit)
+
+
 def complete_packages_git(prefix: str, limit: int) -> List[str]:
     prefix = prefix.strip()
     if not prefix:
@@ -1013,6 +1333,25 @@ def complete_packages_git(prefix: str, limit: int) -> List[str]:
     return names
 
 
+def complete_packages_rpc(prefix: str, limit: int) -> List[str]:
+    prefix = prefix.strip()
+    if not prefix:
+        return []
+    suggestions = aur_rpc_suggest(prefix)
+    names: List[str] = []
+    seen: Set[str] = set()
+    for suggestion in suggestions:
+        if not suggestion.startswith(prefix):
+            continue
+        if suggestion in seen:
+            continue
+        seen.add(suggestion)
+        names.append(suggestion)
+        if len(names) >= limit:
+            break
+    return names
+
+
 def inspect_package(
     package: str,
     dest_root: Path,
@@ -1021,6 +1360,43 @@ def inspect_package(
     target: str,
     show_deps: bool,
 ) -> None:
+    if USE_AUR_RPC and target == "info":
+        info = aur_rpc_info(package)
+        if info:
+            deps = dependency_set_from_rpc(info)
+            print(f"Package: {package}")
+            description = info.get("Description") if isinstance(info.get("Description"), str) else None
+            if description:
+                print(f"Description: {description}")
+            if deps.depends:
+                print("Depends:")
+                for dep in sorted(deps.depends):
+                    print(f"  {dep}")
+            else:
+                print("Depends: (none)")
+            if show_deps:
+                if deps.makedepends:
+                    print("Make depends:")
+                    for dep in sorted(deps.makedepends):
+                        print(f"  {dep}")
+                else:
+                    print("Make depends: (none)")
+                if deps.checkdepends:
+                    print("Check depends:")
+                    for dep in sorted(deps.checkdepends):
+                        print(f"  {dep}")
+                else:
+                    print("Check depends: (none)")
+                if deps.optdepends:
+                    print("Optional:")
+                    for dep in sorted(deps.optdepends):
+                        print(f"  {dep}")
+                else:
+                    print("Optional: (none)")
+            return
+        if USE_AUR_RPC:
+            raise AurGitError(f"Package '{package}' not found via AUR RPC")
+
     package_dir = ensure_clone(package, dest_root, refresh=refresh)
     if target == "PKGBUILD":
         pkgbuild_path = package_dir / "PKGBUILD"
@@ -1072,7 +1448,7 @@ def fetch_package(package: str, dest_root: Path, *, refresh: bool, force: bool) 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Work with AUR packages via the official git mirror"
+        description="Work with AUR packages via the git mirror or AUR RPC"
     )
     parser.add_argument(
         "--dest-root",
@@ -1084,6 +1460,19 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-color",
         action="store_true",
         help="Disable coloured output",
+    )
+    parser.add_argument(
+        "--aur-rpc",
+        dest="aur_rpc",
+        action="store_true",
+        default=True,
+        help="Use the AUR RPC API for metadata and dependency resolution (default)",
+    )
+    parser.add_argument(
+        "--git-mirror",
+        dest="aur_rpc",
+        action="store_false",
+        help="Use the git mirror for metadata and dependency resolution",
     )
     subparsers = parser.add_subparsers(dest="command")
 
@@ -1105,7 +1494,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Specific foreign package names to update (default: all from pacman -Qm)",
     )
     update_parser.add_argument("--noconfirm", action="store_true", help="Pass --noconfirm to pacman/makepkg")
-    search_parser = subparsers.add_parser("search", help="Search packages via the git mirror")
+    search_parser = subparsers.add_parser("search", help="Search packages via the configured backend")
     search_parser.add_argument("pattern", help="Substring or regex to match against package names")
     search_parser.add_argument("--regex", action="store_true", help="Treat the pattern as a regular expression")
     search_parser.add_argument("--limit", type=int, help="Limit results to the first N matches")
@@ -1162,8 +1551,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         parser.print_help()
         return 0
 
-    global USE_COLOR
+    global USE_COLOR, USE_AUR_RPC, FORCE_GIT_MIRROR
     USE_COLOR = not getattr(args, "no_color", False) and sys.stdout.isatty()
+    USE_AUR_RPC = bool(getattr(args, "aur_rpc", True))
+    FORCE_GIT_MIRROR = not USE_AUR_RPC
 
     try:
         if args.command == "fetch":
@@ -1193,7 +1584,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     return 1
             else:
                 needle = args.pattern.lower()
-            results = search_packages_git(
+            results = search_packages(
                 args.pattern,
                 regex=regex_obj,
                 needle=needle,
@@ -1248,7 +1639,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             limit = max(1, args.limit)
             names: List[str] = []
             if args.subcommand == "install":
-                names = complete_packages_git(prefix, limit)
+                names = complete_packages(prefix, limit)
             for name in names:
                 print(name)
             return 0
