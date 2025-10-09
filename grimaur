@@ -51,6 +51,9 @@ _RPC_FALLBACK_NOTIFIED = False
 
 _COMMON_AUR_SUFFIXES = ("-bin",)
 
+_GLOBAL_FLAG_OPTIONS = {"--refresh", "--no-color", "--aur-rpc", "--git-mirror"}
+_GLOBAL_VALUE_OPTIONS = {"--dest-root"}
+
 
 def style(text: str, *codes: str) -> str:
     if not USE_COLOR or not codes:
@@ -859,6 +862,61 @@ def install_official_packages(packages: Iterable[str], *, noconfirm: bool) -> No
     invalidate_installed_cache()
 
 
+def collect_missing_official_packages(
+    package: str,
+    dest_root: Path,
+    *,
+    refresh: bool,
+    visited: Optional[Set[str]] = None,
+) -> tuple[Set[str], Set[str]]:
+    """Return official packages missing for the dependency tree rooted at package."""
+    visited = visited or set()
+    if package in visited:
+        return set(), set()
+    visited.add(package)
+
+    info: Optional[dict] = None
+    deps: Optional[DependencySet] = None
+    if USE_AUR_RPC:
+        info = aur_rpc_info(package)
+        if info:
+            deps = dependency_set_from_rpc(info)
+    if deps is None:
+        package_dir = ensure_clone(package, dest_root, refresh=refresh)
+        srcinfo = read_srcinfo(package_dir)
+        _, _, deps = parse_dependencies(srcinfo)
+
+    missing_official: Set[str] = set()
+    unresolved: Set[str] = set()
+
+    for dep in sorted(deps.all_build_deps):
+        if dep == package:
+            continue
+        if is_dependency_satisfied(dep):
+            continue
+        provider = resolve_official_dependency(dep)
+        if provider:
+            missing_official.add(provider)
+            continue
+        aur_provider = resolve_aur_dependency(dep)
+        if aur_provider:
+            child_missing, child_unresolved = collect_missing_official_packages(
+                aur_provider,
+                dest_root,
+                refresh=refresh,
+                visited=visited,
+            )
+            missing_official.update(child_missing)
+            unresolved.update(child_unresolved)
+            continue
+        if _pacman_returns_zero(["pacman", "-Sp", dep]):
+            missing_official.add(dep)
+            continue
+        unresolved.add(dep)
+
+    return missing_official, unresolved
+
+
 def build_and_install(package_dir: Path, *, noconfirm: bool) -> None:
     pkgbuild_path = package_dir / "PKGBUILD"
     if not pkgbuild_path.exists():
@@ -879,11 +937,15 @@ def install_package(
     refresh: bool,
     noconfirm: bool,
     visited: Optional[Set[str]] = None,
+    preinstalled_official: Optional[Set[str]] = None,
 ) -> None:
     visited = visited or set()
     if package in visited:
         return
     visited.add(package)
+
+    if preinstalled_official is None:
+        preinstalled_official = set()
 
     package_dir: Optional[Path] = None
     info: Optional[dict] = None
@@ -932,7 +994,10 @@ def install_package(
         raise AurGitError(f"Could not resolve providers for: {missing_list}")
 
     if missing_official:
-        install_official_packages(missing_official, noconfirm=noconfirm)
+        to_install = missing_official - preinstalled_official
+        if to_install:
+            install_official_packages(to_install, noconfirm=noconfirm)
+            preinstalled_official.update(to_install)
 
     if aur_dependencies and not noconfirm:
         print(style("The following AUR dependencies are required:", CYAN))
@@ -953,6 +1018,7 @@ def install_package(
             refresh=refresh,
             noconfirm=noconfirm,
             visited=visited,
+            preinstalled_official=preinstalled_official,
         )
 
     if package_dir is None:
@@ -1061,6 +1127,7 @@ def update_packages(
         selected_candidates = pending_updates
 
     shared_visited: Set[str] = set()
+    shared_preinstalled_official: Set[str] = set()
     for candidate in selected_candidates:
         try:
             install_package(
@@ -1069,6 +1136,7 @@ def update_packages(
                 refresh=refresh,
                 noconfirm=noconfirm,
                 visited=shared_visited,
+                preinstalled_official=shared_preinstalled_official,
             )
         except AurGitError as exc:
             print(f"error updating {candidate.name}: {exc}", file=sys.stderr)
@@ -1599,7 +1667,30 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     argv_list = list(argv if argv is not None else sys.argv[1:])
     commands = {"fetch", "install", "update", "search", "inspect", "complete"}
     if argv_list and not argv_list[0].startswith("-") and argv_list[0] not in commands:
-        argv_list = ["search"] + argv_list
+        reordered: List[str] = []
+        remaining: List[str] = []
+        i = 0
+        while i < len(argv_list):
+            item = argv_list[i]
+            if item == "--":
+                remaining.extend(argv_list[i:])
+                break
+            if item in _GLOBAL_FLAG_OPTIONS:
+                reordered.append(item)
+            elif any(item.startswith(f"{opt}=") for opt in _GLOBAL_VALUE_OPTIONS):
+                reordered.append(item)
+            elif item in _GLOBAL_VALUE_OPTIONS:
+                reordered.append(item)
+                if i + 1 < len(argv_list):
+                    reordered.append(argv_list[i + 1])
+                    i += 1
+            else:
+                remaining.append(item)
+            i += 1
+        else:
+            # ensure natural exit when loop completes without break
+            pass
+        argv_list = reordered + ["search"] + remaining
 
     parser = build_parser()
     args = parser.parse_args(argv_list)
@@ -1619,11 +1710,28 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if args.command == "fetch":
             fetch_package(args.package, dest_root, refresh=refresh, force=args.force)
         elif args.command == "install":
+            preinstalled_official: Optional[Set[str]] = None
+            if USE_AUR_RPC:
+                missing_official, unresolved = collect_missing_official_packages(
+                    args.package,
+                    dest_root,
+                    refresh=refresh,
+                )
+                if unresolved:
+                    missing_list = ", ".join(sorted(unresolved))
+                    raise AurGitError(f"Could not resolve providers for: {missing_list}")
+                if missing_official:
+                    install_official_packages(
+                        missing_official,
+                        noconfirm=args.noconfirm,
+                    )
+                preinstalled_official = set(missing_official)
             install_package(
                 args.package,
                 dest_root,
                 refresh=refresh,
                 noconfirm=args.noconfirm,
+                preinstalled_official=preinstalled_official,
             )
         elif args.command == "update":
             update_packages(
@@ -1681,6 +1789,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
             exit_code = 0
             shared_visited: Set[str] = set()
+            shared_preinstalled_official: Set[str] = set()
             for item in selected:
                 try:
                     install_package(
@@ -1689,6 +1798,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         refresh=refresh,
                         noconfirm=args.noconfirm,
                         visited=shared_visited,
+                        preinstalled_official=shared_preinstalled_official,
                     )
                 except AurGitError as exc:
                     exit_code = 1
